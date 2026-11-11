@@ -2,7 +2,7 @@ import pytest
 from unittest.mock import Mock, patch
 import jwt
 
-from mcpauth.auth.token_verifier import TokenVerifier
+from mcpauth.auth.token_verifier import TokenVerifier, validate_token_claims
 from mcpauth.config import (
     AuthServerConfig,
     AuthServerType,
@@ -16,6 +16,7 @@ from mcpauth.exceptions import (
     AuthServerExceptionCode,
     MCPAuthAuthServerException,
 )
+from mcpauth.types import AuthInfo
 
 
 @pytest.fixture
@@ -150,3 +151,82 @@ def test_create_verify_jwt_function_no_jwks_uri(
         verify_jwt_func(token)
     assert excinfo.value.code == AuthServerExceptionCode.MISSING_JWKS_URI
     mock_create_verify_jwt.assert_not_called() 
+
+
+def _make_auth_info(
+    issuer: str = "https://auth.example.com",
+    audience="my-api",
+    scopes=None,
+) -> AuthInfo:
+    return AuthInfo(
+        token="token",
+        issuer=issuer,
+        client_id="client-id",
+        subject="subject-id",
+        audience=audience,
+        scopes=scopes if scopes is not None else ["read", "write"],
+        claims={},
+    )
+
+
+class TestValidateTokenClaims:
+    def test_should_pass_when_nothing_is_configured(self):
+        # Backward compatibility: all checks stay disabled when not configured
+        validate_token_claims(_make_auth_info(issuer="https://anything.example.com"))
+
+    def test_should_pass_when_all_claims_match(self):
+        validate_token_claims(
+            _make_auth_info(),
+            issuer="https://auth.example.com",
+            audience="my-api",
+            required_scopes=["read", "write"],
+        )
+
+    def test_jwt_issuer_exact_match_no_trailing_slash_tolerance(self):
+        with pytest.raises(MCPAuthBearerAuthException) as excinfo:
+            validate_token_claims(
+                _make_auth_info(issuer="https://auth.example.com/"),
+                issuer="https://auth.example.com",
+            )
+        assert excinfo.value.code == BearerAuthExceptionCode.INVALID_ISSUER
+
+    def test_jwt_issuer_mismatch(self):
+        with pytest.raises(MCPAuthBearerAuthException) as excinfo:
+            validate_token_claims(
+                _make_auth_info(issuer="https://evil.example.com"),
+                issuer="https://auth.example.com",
+            )
+        assert excinfo.value.code == BearerAuthExceptionCode.INVALID_ISSUER
+
+    def test_jwt_audience_string_match(self):
+        validate_token_claims(_make_auth_info(audience="my-api"), audience="my-api")
+
+    def test_jwt_audience_list_intersection(self):
+        validate_token_claims(
+            _make_auth_info(audience=["other-api", "my-api"]), audience="my-api"
+        )
+
+    def test_jwt_audience_mismatch(self):
+        for token_audience in ("other-api", ["other-api"], None):
+            with pytest.raises(MCPAuthBearerAuthException) as excinfo:
+                validate_token_claims(
+                    _make_auth_info(audience=token_audience), audience="my-api"
+                )
+            assert excinfo.value.code == BearerAuthExceptionCode.INVALID_AUDIENCE
+
+    def test_scope_check_requires_all_required_scopes(self):
+        validate_token_claims(_make_auth_info(), required_scopes=["read"])
+        with pytest.raises(MCPAuthBearerAuthException) as excinfo:
+            validate_token_claims(
+                _make_auth_info(scopes=["read"]),
+                required_scopes=["read", "write"],
+            )
+        assert excinfo.value.code == BearerAuthExceptionCode.MISSING_REQUIRED_SCOPES
+        assert excinfo.value.cause is not None
+        assert excinfo.value.cause.missing_scopes == ["write"]
+
+    def test_scope_check_disabled_for_empty_list(self):
+        # An empty required-scopes list means "no scopes required" — it must
+        # neither deny access nor demand any particular scope.
+        validate_token_claims(_make_auth_info(scopes=[]), required_scopes=[])
+        validate_token_claims(_make_auth_info(scopes=["read"]), required_scopes=[])

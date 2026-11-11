@@ -762,10 +762,8 @@ class TestHandleBearerAuthMiddleware:
 
         assert response.status_code == 401
         assert "WWW-Authenticate" in response.headers
-        assert (
-            f'error="{BearerAuthExceptionCode.INVALID_ISSUER.value}"'
-            in response.headers["WWW-Authenticate"]
-        )
+        # RFC 6750: issuer mismatch is reported as `invalid_token`
+        assert 'error="invalid_token"' in response.headers["WWW-Authenticate"]
         assert (
             'resource_metadata="https://my-api.com/.well-known/oauth-protected-resource"'
             in response.headers["WWW-Authenticate"]
@@ -813,3 +811,213 @@ class TestHandleBearerAuthMiddleware:
             f'error="{MCPAuthTokenVerificationExceptionCode.INVALID_TOKEN.value}"'
             in response.headers["WWW-Authenticate"]
         )
+
+
+@pytest.mark.asyncio
+class TestRfc6750WwwAuthenticateHeader:
+    """
+    End-to-end checks of the RFC 6750 `WWW-Authenticate` header semantics:
+    `invalid_token` for authentication failures, `insufficient_scope` for
+    authenticated tokens that lack required scopes.
+    """
+
+    ISSUER = "https://example.com"
+    AUDIENCE = "test-audience"
+    RESOURCE = "https://my-api.com"
+    REQUIRED_SCOPES = ["read", "write"]
+
+    @pytest.fixture
+    def auth_info_var(self):
+        return ContextVar("auth_info", default=None)
+
+    def _make_middleware(
+        self,
+        auth_info_var,
+        verify=None,
+        required_scopes=None,
+    ):
+        def default_verify(token: str) -> AuthInfo:
+            if token == "valid-token":
+                return AuthInfo(
+                    issuer=self.ISSUER,
+                    client_id="client-id",
+                    scopes=["read", "write"],
+                    token=token,
+                    audience=self.AUDIENCE,
+                    subject="subject-id",
+                    claims={},
+                )
+            raise MCPAuthTokenVerificationException(
+                MCPAuthTokenVerificationExceptionCode.INVALID_TOKEN
+            )
+
+        config = BearerAuthConfig(
+            issuer=self.ISSUER,
+            audience=self.AUDIENCE,
+            required_scopes=(
+                self.REQUIRED_SCOPES if required_scopes is None else required_scopes
+            ),
+            resource=self.RESOURCE,
+        )
+        MiddlewareClass = create_bearer_auth(
+            verify or default_verify, config, auth_info_var
+        )
+        return MiddlewareClass(app=MagicMock())
+
+    @staticmethod
+    def _request(headers=None) -> Request:
+        return Request(
+            scope={
+                "type": "http",
+                "headers": headers or [],
+                "method": "GET",
+                "path": "/",
+            }
+        )
+
+    async def test_jwt_missing_token_returns_invalid_token_header(
+        self, auth_info_var
+    ):
+        middleware = self._make_middleware(auth_info_var)
+        response = await middleware.dispatch(self._request(), MagicMock())
+
+        assert response.status_code == 401
+        header = response.headers["WWW-Authenticate"]
+        assert header.startswith("Bearer ")
+        assert f'realm="{self.RESOURCE}"' in header
+        assert 'error="invalid_token"' in header
+        assert 'error_description="Missing `Authorization` header.' in header
+
+    async def test_jwt_malformed_header_returns_invalid_token_header(
+        self, auth_info_var
+    ):
+        middleware = self._make_middleware(auth_info_var)
+        request = self._request([(b"authorization", b"not-a-bearer-header")])
+        response = await middleware.dispatch(request, MagicMock())
+
+        assert response.status_code == 401
+        header = response.headers["WWW-Authenticate"]
+        assert 'error="invalid_token"' in header
+        assert "error_description=" in header
+
+    async def test_jwt_bad_token_returns_invalid_token_header(self, auth_info_var):
+        middleware = self._make_middleware(auth_info_var)
+        request = self._request([(b"authorization", b"Bearer bad-token")])
+        response = await middleware.dispatch(request, MagicMock())
+
+        assert response.status_code == 401
+        header = response.headers["WWW-Authenticate"]
+        assert 'error="invalid_token"' in header
+        assert (
+            'resource_metadata="https://my-api.com/.well-known/oauth-protected-resource"'
+            in header
+        )
+        # The description must not leak the raw token
+        assert "bad-token" not in header
+
+    async def test_jwt_wrong_issuer_returns_invalid_token_header(self, auth_info_var):
+        def verify(token: str) -> AuthInfo:
+            return AuthInfo(
+                issuer="https://wrong-issuer.com",
+                client_id="client-id",
+                scopes=["read", "write"],
+                token=token,
+                audience=self.AUDIENCE,
+                subject="subject-id",
+                claims={},
+            )
+
+        middleware = self._make_middleware(auth_info_var, verify=verify)
+        request = self._request([(b"authorization", b"Bearer valid-token")])
+        response = await middleware.dispatch(request, MagicMock())
+
+        assert response.status_code == 401
+        header = response.headers["WWW-Authenticate"]
+        assert 'error="invalid_token"' in header
+        assert "valid-token" not in header
+
+    async def test_jwt_wrong_audience_returns_invalid_token_header(
+        self, auth_info_var
+    ):
+        def verify(token: str) -> AuthInfo:
+            return AuthInfo(
+                issuer=self.ISSUER,
+                client_id="client-id",
+                scopes=["read", "write"],
+                token=token,
+                audience=["some-other-api"],
+                subject="subject-id",
+                claims={},
+            )
+
+        middleware = self._make_middleware(auth_info_var, verify=verify)
+        request = self._request([(b"authorization", b"Bearer valid-token")])
+        response = await middleware.dispatch(request, MagicMock())
+
+        assert response.status_code == 401
+        header = response.headers["WWW-Authenticate"]
+        assert 'error="invalid_token"' in header
+
+    async def test_scope_insufficient_returns_403_with_insufficient_scope_header(
+        self, auth_info_var
+    ):
+        def verify(token: str) -> AuthInfo:
+            return AuthInfo(
+                issuer=self.ISSUER,
+                client_id="client-id",
+                scopes=["read"],  # missing "write"
+                token=token,
+                audience=self.AUDIENCE,
+                subject="subject-id",
+                claims={},
+            )
+
+        middleware = self._make_middleware(auth_info_var, verify=verify)
+        request = self._request([(b"authorization", b"Bearer valid-token")])
+        response = await middleware.dispatch(request, MagicMock())
+
+        assert response.status_code == 403
+        header = response.headers["WWW-Authenticate"]
+        assert header.startswith("Bearer ")
+        assert f'realm="{self.RESOURCE}"' in header
+        assert 'error="insufficient_scope"' in header
+        assert 'error_description="' in header
+        assert 'scope="read write"' in header
+
+    async def test_scope_empty_required_list_disables_scope_check(
+        self, auth_info_var
+    ):
+        def verify(token: str) -> AuthInfo:
+            return AuthInfo(
+                issuer=self.ISSUER,
+                client_id="client-id",
+                scopes=[],
+                token=token,
+                audience=self.AUDIENCE,
+                subject="subject-id",
+                claims={},
+            )
+
+        middleware = self._make_middleware(
+            auth_info_var, verify=verify, required_scopes=[]
+        )
+        request = self._request([(b"authorization", b"Bearer valid-token")])
+        next_call = AsyncMock(return_value=Response(status_code=200))
+
+        response = await middleware.dispatch(request, next_call)
+
+        assert response.status_code == 200
+        next_call.assert_called_once()
+
+    async def test_jwt_full_pass_calls_next_without_www_authenticate(
+        self, auth_info_var
+    ):
+        middleware = self._make_middleware(auth_info_var)
+        request = self._request([(b"authorization", b"Bearer valid-token")])
+        next_call = AsyncMock(return_value=Response(status_code=200))
+
+        response = await middleware.dispatch(request, next_call)
+
+        assert response.status_code == 200
+        next_call.assert_called_once()
+        assert "WWW-Authenticate" not in response.headers

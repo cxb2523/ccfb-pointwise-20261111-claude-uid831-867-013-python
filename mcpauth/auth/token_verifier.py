@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Optional
 
 import jwt
 from ..config import AuthServerConfig
@@ -7,11 +7,71 @@ from ..exceptions import (
     BearerAuthExceptionCode,
     MCPAuthAuthServerException,
     MCPAuthBearerAuthException,
+    MCPAuthBearerAuthExceptionDetails,
     MCPAuthTokenVerificationException,
     MCPAuthTokenVerificationExceptionCode,
 )
 from ..types import AuthInfo, VerifyAccessTokenFunction
 from ..utils import create_verify_jwt
+
+
+def validate_token_claims(
+    auth_info: AuthInfo,
+    issuer: Optional[str] = None,
+    audience: Optional[str] = None,
+    required_scopes: Optional[List[str]] = None,
+) -> None:
+    """
+    Shared validation of the claims extracted from an access token. Used by the
+    Bearer auth middleware for both the resource server and authorization server
+    handlers, so the checks live in exactly one place.
+
+    Each check is only enabled when the corresponding expectation is configured;
+    anything left unset stays disabled for backward compatibility.
+
+    :param auth_info: The authentication information extracted from the token.
+    :param issuer: The expected issuer. Compared with an exact string match —
+        no normalization (e.g. no trailing-slash tolerance) is applied.
+    :param audience: The expected audience. The token's `aud` claim may be a
+        string or a list of strings; the check passes when the expected audience
+        intersects the token's audiences.
+    :param required_scopes: Scopes the token must have been granted. All of them
+        must be present. An empty list means "no scopes required" and disables
+        the check — it is neither "deny all" nor "any scope will do".
+    :raises MCPAuthBearerAuthException: If any enabled check fails.
+    """
+    if issuer is not None and auth_info.issuer != issuer:
+        raise MCPAuthBearerAuthException(
+            BearerAuthExceptionCode.INVALID_ISSUER,
+            cause=MCPAuthBearerAuthExceptionDetails(
+                expected=issuer, actual=auth_info.issuer
+            ),
+        )
+
+    if audience is not None:
+        token_audiences = (
+            [auth_info.audience]
+            if isinstance(auth_info.audience, str)
+            else auth_info.audience if isinstance(auth_info.audience, list) else []
+        )
+        if audience not in token_audiences:
+            raise MCPAuthBearerAuthException(
+                BearerAuthExceptionCode.INVALID_AUDIENCE,
+                cause=MCPAuthBearerAuthExceptionDetails(
+                    expected=audience, actual=auth_info.audience
+                ),
+            )
+
+    if required_scopes:
+        granted_scopes = set(auth_info.scopes)
+        missing_scopes = [
+            scope for scope in required_scopes if scope not in granted_scopes
+        ]
+        if missing_scopes:
+            raise MCPAuthBearerAuthException(
+                BearerAuthExceptionCode.MISSING_REQUIRED_SCOPES,
+                cause=MCPAuthBearerAuthExceptionDetails(missing_scopes=missing_scopes),
+            )
 
 
 class TokenVerifier:
@@ -53,10 +113,6 @@ class TokenVerifier:
 
     def validate_jwt_issuer(self, issuer: str):
         if issuer not in self._issuers:
-            # The cause of MCPAuthBearerAuthException is MCPAuthBearerAuthExceptionDetails,
-            # which is a BaseModel. We need to create it.
-            from ..exceptions import MCPAuthBearerAuthExceptionDetails
-
             raise MCPAuthBearerAuthException(
                 BearerAuthExceptionCode.INVALID_ISSUER,
                 cause=MCPAuthBearerAuthExceptionDetails(

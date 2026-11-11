@@ -14,10 +14,11 @@ from ..exceptions import (
     MCPAuthAuthServerException,
     MCPAuthConfigException,
     BearerAuthExceptionCode,
-    MCPAuthBearerAuthExceptionDetails,
+    to_rfc6750_error_code,
 )
 from ..types import AuthInfo, VerifyAccessTokenFunction, Record
 from ..utils import BearerWWWAuthenticateHeader, create_resource_metadata_endpoint
+from ..auth.token_verifier import validate_token_claims
 
 
 class BearerAuthConfig(BaseModel):
@@ -89,7 +90,10 @@ def get_bearer_token_from_headers(headers: Headers) -> str:
 
 
 def _handle_error(
-    error: Exception, resource: Optional[str] = None, show_error_details: bool = False
+    error: Exception,
+    resource: Optional[str] = None,
+    show_error_details: bool = False,
+    required_scopes: Optional[List[str]] = None,
 ) -> tuple[int, Dict[str, Any], Dict[str, str]]:
     """
     Handle errors from the Bearer auth process.
@@ -98,17 +102,28 @@ def _handle_error(
       error: The exception that was caught.
       resource: The resource identifier for which the auth failed.
       show_error_details: Whether to include detailed error information in the response.
+      required_scopes: The scopes required by the endpoint, echoed in the
+        `WWW-Authenticate` header for `insufficient_scope` errors (RFC 6750).
 
     Returns:
       A tuple of (status_code, response_body, headers).
     """
     headers: Dict[str, str] = {}
     www_authenticate_header = BearerWWWAuthenticateHeader()
+    www_authenticate_header.set_parameter_if_value_exists(
+        "realm", resource or "mcp-auth"
+    )
 
     if isinstance(error, (MCPAuthTokenVerificationException, MCPAuthBearerAuthException)):
-        www_authenticate_header.set_parameter_if_value_exists("error", error.code.value)
+        www_authenticate_header.set_parameter_if_value_exists(
+            "error", to_rfc6750_error_code(error)
+        )
+        # Only the static, sanitized message is exposed — never the exception
+        # cause, which may contain the raw token or a stack trace.
         if error.message:
-            www_authenticate_header.set_parameter_if_value_exists("error_description", error.message)
+            www_authenticate_header.set_parameter_if_value_exists(
+                "error_description", error.message
+            )
 
     resource_metadata_endpoint = (
         create_resource_metadata_endpoint(resource) if resource else None
@@ -123,11 +138,14 @@ def _handle_error(
         return 401, error.to_json(show_error_details), headers
 
     if isinstance(error, MCPAuthBearerAuthException):
-        status_code = (
-            403
-            if error.code == BearerAuthExceptionCode.MISSING_REQUIRED_SCOPES
-            else 401
+        is_insufficient_scope = (
+            error.code == BearerAuthExceptionCode.MISSING_REQUIRED_SCOPES
         )
+        status_code = 403 if is_insufficient_scope else 401
+        if is_insufficient_scope and required_scopes:
+            www_authenticate_header.set_parameter_if_value_exists(
+                "scope", " ".join(required_scopes)
+            )
         if status_code == 401 and resource_metadata_endpoint:
             www_authenticate_header.set_parameter_if_value_exists(
                 "resource_metadata", resource_metadata_endpoint
@@ -208,45 +226,16 @@ def create_bearer_auth(
 
                 if callable(config.issuer):
                     config.issuer(auth_info.issuer)
-                elif auth_info.issuer != config.issuer:
-                    details = MCPAuthBearerAuthExceptionDetails(
-                        expected=config.issuer, actual=auth_info.issuer
-                    )
-                    raise MCPAuthBearerAuthException(
-                        BearerAuthExceptionCode.INVALID_ISSUER, cause=details
-                    )
+                    expected_issuer = None
+                else:
+                    expected_issuer = config.issuer
 
-                if config.audience:
-                    audience_matches = (
-                        config.audience == auth_info.audience
-                        if isinstance(auth_info.audience, str)
-                        else (
-                            isinstance(auth_info.audience, list)
-                            and config.audience in auth_info.audience
-                        )
-                    )
-                    if not audience_matches:
-                        details = MCPAuthBearerAuthExceptionDetails(
-                            expected=config.audience, actual=auth_info.audience
-                        )
-                        raise MCPAuthBearerAuthException(
-                            BearerAuthExceptionCode.INVALID_AUDIENCE, cause=details
-                        )
-
-                if config.required_scopes:
-                    missing_scopes = [
-                        scope
-                        for scope in config.required_scopes
-                        if scope not in auth_info.scopes
-                    ]
-                    if missing_scopes:
-                        details = MCPAuthBearerAuthExceptionDetails(
-                            missing_scopes=missing_scopes
-                        )
-                        raise MCPAuthBearerAuthException(
-                            BearerAuthExceptionCode.MISSING_REQUIRED_SCOPES,
-                            cause=details,
-                        )
+                validate_token_claims(
+                    auth_info,
+                    issuer=expected_issuer,
+                    audience=config.audience,
+                    required_scopes=config.required_scopes,
+                )
 
                 if context_var.get() is not None:
                     logging.warning(
@@ -262,7 +251,10 @@ def create_bearer_auth(
             except Exception as error:
                 logging.error(f"Error during Bearer auth: {error}")
                 status_code, response_body, headers = _handle_error(
-                    error, config.resource, config.show_error_details
+                    error,
+                    config.resource,
+                    config.show_error_details,
+                    config.required_scopes,
                 )
                 return JSONResponse(status_code=status_code, content=response_body, headers=headers)
 

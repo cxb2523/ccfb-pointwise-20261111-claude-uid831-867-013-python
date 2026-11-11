@@ -148,6 +148,33 @@ class MCPAuthTokenVerificationExceptionCode(str, Enum):
     TOKEN_VERIFICATION_FAILED = "token_verification_failed"
 
 
+class Rfc6750ErrorCode(str, Enum):
+    """
+    Error codes defined by RFC 6750 Section 3.1 for the `WWW-Authenticate` header.
+    """
+
+    INVALID_TOKEN = "invalid_token"
+    INSUFFICIENT_SCOPE = "insufficient_scope"
+
+
+def to_rfc6750_error_code(error: "MCPAuthException") -> str:
+    """
+    Maps an mcp-auth exception to the RFC 6750 error code that should be sent in
+    the `WWW-Authenticate` response header.
+
+    All authentication failures (missing or malformed token, issuer or audience
+    mismatch, token verification errors) map to `invalid_token`; only a
+    successfully authenticated token that lacks the required scopes maps to
+    `insufficient_scope`.
+    """
+    if (
+        isinstance(error, MCPAuthBearerAuthException)
+        and error.code == BearerAuthExceptionCode.MISSING_REQUIRED_SCOPES
+    ):
+        return Rfc6750ErrorCode.INSUFFICIENT_SCOPE.value
+    return Rfc6750ErrorCode.INVALID_TOKEN.value
+
+
 token_verification_exception_description: Dict[
     MCPAuthTokenVerificationExceptionCode, str
 ] = {
