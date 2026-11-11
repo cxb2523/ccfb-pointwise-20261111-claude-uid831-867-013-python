@@ -1,0 +1,10 @@
+{
+  "session_id": "70137ed8-11e6-451a-ab87-39a01d195d4b",
+  "turn_id": "47eb98f5-b9b3-452a-bd05-a67b2006a047",
+  "trace": "artifacts/70137ed8-11e6-451a-ab87-39a01d195d4b.jsonl",
+  "context_stream": "artifacts/context_stream_70137ed8-11e6-451a-ab87-39a01d195d4b.jsonl",
+  "context_evidence": "artifacts/context_evidence_70137ed8-11e6-451a-ab87-39a01d195d4b.json",
+  "context_window": 1000000,
+  "recording": "",
+  "uploaded_at": "2026-11-11 13:11:25"
+}
